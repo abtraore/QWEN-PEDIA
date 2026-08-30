@@ -39,7 +39,7 @@ upstream thread and retires when the fix merges.
 
 The findings behind these recipes are contributed back where they belong:
 
-- [vllm-project/recipes#870](https://github.com/vllm-project/recipes/pull/870): Flash-Next verified at 200 tok/s decode on 4x RTX 5090, with the sm120 knobs explained
-- [vllm-project/vllm#54275](https://github.com/vllm-project/vllm/pull/54275): fix for the kv-cache-memory advisory that OOMs when other processes hold GPU memory
-- [fp8 KV for QSA](https://gist.github.com/abtraore/329547468a6eb04ecedac38250148093), offered on [vllm#53896](https://github.com/vllm-project/vllm/pull/53896): pool +78%, outputs md5-identical to bf16
-- [vllm-project/recipes#785](https://github.com/vllm-project/recipes/pull/785): Muse-Glimmer-30B verified on RTX 5090 (1x and 2x)
+- 2026-08-28 [vllm-project/recipes#870](https://github.com/vllm-project/recipes/pull/870): Flash-Next verified at 200 tok/s decode on 4x RTX 5090, with the sm120 knobs explained
+- 2026-08-28 [vllm-project/vllm#54275](https://github.com/vllm-project/vllm/pull/54275): fix for the kv-cache-memory advisory that OOMs when other processes hold GPU memory
+- 2026-08-28 [fp8 KV for QSA](https://gist.github.com/abtraore/329547468a6eb04ecedac38250148093), offered on [vllm#53896](https://github.com/vllm-project/vllm/pull/53896): pool +78%, outputs md5-identical to bf16
+- 2026-08-11 [vllm-project/recipes#785](https://github.com/vllm-project/recipes/pull/785): Muse-Glimmer-30B verified on RTX 5090 (1x and 2x)

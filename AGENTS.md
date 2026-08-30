@@ -20,6 +20,8 @@ messages, PR bodies. The writing rules below are mandatory.
   from a live run with the published flags, benchmarked with
   `tools/llm-bench` (fresh salt, warmup discarded). No projected or
   borrowed numbers.
+- **Upstream-trail entries carry their date** (the PR/comment creation
+  date, `YYYY-MM-DD`, at the start of the line), newest first.
 - **No prebuilt images.** Dockerfiles only, pinned base digests, patch
   files published in-repo. Every patch names its upstream thread and its
   retirement condition.
