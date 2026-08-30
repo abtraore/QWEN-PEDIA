@@ -1,0 +1,41 @@
+# QWEN-PEDIA
+
+A hub for fast, verified Qwen serving recipes on consumer hardware. Every
+number here was measured on real machines with the exact commands published
+next to it. No screenshots without flags, no "trust me" throughput.
+
+Community project, not affiliated with Alibaba or the Qwen team.
+
+## Hardware
+
+Current fleet: one box, "saturn": 6x RTX 5090 32 GB (sm120, PCIe, no NVLink),
+AMD 5955WX, 125 GB RAM. Recipes state how many of the six cards they use.
+More hardware will join as it arrives; recipes are tagged per configuration.
+
+## Recipes
+
+| model | engine | hardware | context | decode | prefill @depth | KV pool | recipe |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next (NVFP4) | vLLM nightly + patches | 4x 5090 | 393,216 (YaRN 1.5) | 203-211 tok/s, flat to 186K | 2,350-2,690 tok/s | 786,432 tok | [recipe](recipes/qwen3.8-flash-next/) |
+
+Decode is single-stream on code-shaped prompts, greedy, warmup discarded.
+Prefill is cold, measured at 99K-186K context. Full methodology in
+[tools/](tools/): every recipe is benchmarked with `llm-bench`, seeded and
+cache-honest (fresh salt per run against a live server).
+
+## Patched images
+
+Some recipes need patches that have not merged upstream yet. We do not ship
+prebuilt images: each recipe carries a small Dockerfile (pinned base digest +
+COPY of the patch files, all published in the repo) so you build in one
+command and can read every line of what you run. Each patch names its
+upstream thread and retires when the fix merges.
+
+## Upstream trail
+
+The findings behind these recipes are contributed back where they belong:
+
+- [vllm-project/recipes#870](https://github.com/vllm-project/recipes/pull/870): Flash-Next verified at 200 tok/s decode on 4x RTX 5090, with the sm120 knobs explained
+- [vllm-project/vllm#54275](https://github.com/vllm-project/vllm/pull/54275): fix for the kv-cache-memory advisory that OOMs when other processes hold GPU memory
+- [fp8 KV for QSA](https://gist.github.com/abtraore/329547468a6eb04ecedac38250148093), offered on [vllm#53896](https://github.com/vllm-project/vllm/pull/53896): pool +78%, outputs md5-identical to bf16
+- [vllm-project/recipes#785](https://github.com/vllm-project/recipes/pull/785): Muse-Glimmer-30B verified on RTX 5090 (1x and 2x)
