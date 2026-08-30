@@ -14,9 +14,13 @@ More hardware will join as it arrives; recipes are tagged per configuration.
 
 ## Recipes
 
+Newest first: the top row is always the most recently added or updated
+recipe.
+
 | model | engine | hardware | context | decode | prefill @depth | KV pool | recipe |
 |---|---|---|---|---|---|---|---|
 | Qwen3.8-Flash-Next (NVFP4) | vLLM nightly + patches | 4x 5090 | 393,216 (YaRN 1.5) | 203-211 tok/s, flat to 186K | 2,350-2,690 tok/s | 786,432 tok | [recipe](recipes/qwen3.8-flash-next/) |
+| Qwen3.8-27B (NVFP4) | vLLM v0.28.0, no patches | 2x 5090 | 262,144 native | 157 tok/s (212-236 on code) | 4,600-5,050 tok/s | 833,295 tok | [recipe](recipes/qwen3.8-27b/) |
 
 Decode is single-stream on code-shaped prompts, greedy, warmup discarded.
 Prefill is cold, measured at 99K-186K context. Full methodology in
