@@ -3,6 +3,27 @@
 Everything in this repo is outward-facing: READMEs, recipe notes, commit
 messages, PR bodies. The writing rules below are mandatory.
 
+## Repo conventions
+
+- **Every recipe directory carries its own README.md** with, in this order:
+  headline measured numbers, a contents list (one line per file), and a
+  ready-to-copy `docker run` command (build step first when the recipe has
+  a Dockerfile). End with the endpoint URL, the served model name, and any
+  first-use warning (cold start, load time, host RAM needs).
+- Recipe directory layout: `README.md` (copy-paste path), `launch.sh`
+  (parameterized launcher), `NOTES.md` (the whys: traps, knob sweeps,
+  operational rules), plus `Dockerfile` + `patches/` only when upstream
+  images are not enough.
+- **Root README table is newest-first**: the top row is always the most
+  recently added or updated recipe.
+- **Only measured numbers.** Every figure in a README or table must come
+  from a live run with the published flags, benchmarked with
+  `tools/llm-bench` (fresh salt, warmup discarded). No projected or
+  borrowed numbers.
+- **No prebuilt images.** Dockerfiles only, pinned base digests, patch
+  files published in-repo. Every patch names its upstream thread and its
+  retirement condition.
+
 ## Writing style: avoid the AI tells (user, 2026-08-28)
 
 Applies to EVERYTHING written for the user or the outside world (docs, PR bodies, issue reports, artifacts, commit messages, recipe guides, chat replies). These are the patterns to avoid:
