@@ -27,6 +27,22 @@ Prefill is cold, measured at 99K-186K context. Full methodology in
 [tools/](tools/): every recipe is benchmarked with `llm-bench`, seeded and
 cache-honest (fresh salt per run against a live server).
 
+## Related: the EXL3 lane, by Mia'a AI Lab
+
+[Mia'a AI Lab](https://x.com/MiaAI_lab) serves the same Qwen3.8-27B through
+her own [exllamav3 fork](https://github.com/MiaAI-Lab/exllamav3) (DFlash2
+and MTP drafting, NVFP4/FP8 KV cache, GB10/aarch64 as well as x86 CUDA),
+with her own quants:
+[EXL3 3.5bpw target](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw)
+and a
+[DFlash2 EXL3 5.0bpw draft](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw),
+plus a
+[deployment kit](https://github.com/MiaAI-Lab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw).
+Her numbers: 47.5 tok/s on a DGX Spark (4.43 tokens accepted per step) and
+~30-34.5 tok/s on 24 GB cards, hardware this repo does not cover. Her fork
+is also where our fp8 QSA-KV patch learned the sm12x rule that fp8 operands
+need a bf16 upcast before `tl.dot`. Credit where it is due.
+
 ## Patched images
 
 Some recipes need patches that have not merged upstream yet. We do not ship
