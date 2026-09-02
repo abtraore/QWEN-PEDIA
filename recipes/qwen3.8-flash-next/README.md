@@ -18,8 +18,6 @@ Measured on this config: decode 203-211 tok/s on code (MTP acceptance up to
   YaRN drafter pin handled automatically)
 - `NOTES.md`: the six boot walls in order, the knob sweeps, and the
   operational rules (host RAM is part of this recipe)
-- `launch-llamacpp-mtp.sh`: the GGUF lane (llama.cpp + Unsloth's MTP draft
-  head), measured below; slower than vLLM, useful when you want a GGUF
 
 ## Start the server
 
@@ -70,42 +68,5 @@ adds the YaRN override and the drafter's `max_model_len` pin together;
 setting one without the other silently zeroes drafter acceptance past
 262,144 (details in NOTES.md).
 
-## GGUF lane: llama.cpp with Unsloth's MTP head
-
-Unsloth published a separate MTP draft head for this model on 2026-09-02
-(`MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, 2.6 GB; it borrows the
-trunk's embeddings). It needs llama.cpp
-[PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243), not a mainline
-build. The UD-Q4_K_XL trunk shards did not change (same LFS oids as before),
-so only the head is a new download. Measured on 4x RTX 5090, ctx 131,072,
-greedy, `tools/llm-bench` with a fresh salt per run:
-
-| decode tok/s | spec off | n-max 2 | n-max 3 | n-max 5 |
-|---|---|---|---|---|
-| code, fresh generation | 90.9 | 130.5 | 132.9 | 127.5 |
-| code, copy-heavy refactor | 99.4 | 137.5 | 155.5 | 217.9 |
-| prose (two stories) | 88.4 / 89.5 | 100.6 / 103.2 | 93.5 / 103.7 | 82.2 / 82.0 |
-| prose acceptance | | 0.56 | 0.43-0.51 | 0.31 |
-| prefill tok/s at 4.3K | 1,456 | 1,691 | 1,685 | 1,712 |
-
-n-max 2 is the safe default (Unsloth's recommendation holds here): +40% on
-code, +14% on prose. n-max 5 only pays on copy-heavy edits and is slower
-than no drafter on prose. For comparison the vLLM lane above does 203-211
-tok/s on code with prefill at 2,350-2,690, so this lane is the fallback,
-not the fast path.
-
-```bash
-git clone https://github.com/danielhanchen/llama.cpp llama.cpp-mtp
-git -C llama.cpp-mtp checkout 2857e51143bd88ec6fc0246246f42a5d0394d98a
-docker build --target server --build-arg CUDA_DOCKER_ARCH=120 \
-  -t qwen-pedia/fnext-llamacpp-mtp:r1 -f llama.cpp-mtp/.devops/cuda.Dockerfile llama.cpp-mtp
-hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
-./launch-llamacpp-mtp.sh          # NMAX=3 for code-heavy use
-```
-
-Serving on `http://localhost:8038/v1`, model name
-`llamacpp/qwen3.8-flash-next`, about 3 minutes after a warm load (the first
-cold load of 111 GB off disk takes longer). One `borrow_shared_tensor`
-error line at startup is expected: the memory fitter probes the head on its
-own before the trunk exists. Drafting still runs; `draft acceptance = ...`
-lines in the log confirm it.
+The GGUF lane (llama.cpp with Unsloth's MTP draft head, about a third
+slower on the same four cards) is its own recipe: `../qwen3.8-flash-next-gguf/`.

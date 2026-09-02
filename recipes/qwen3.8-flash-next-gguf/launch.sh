@@ -3,13 +3,10 @@
 # Measured 2026-09-02 (greedy, tools/llm-bench, ctx 131,072): code 130-156 tok/s
 # at n-max 2-3 (spec off: 91-99), copy-heavy code 218 at n-max 5, prose 101-104
 # at n-max 2. About 1.3-1.5x slower than the vLLM lane in launch.sh; use this
-# one when you want a GGUF, not the fast path.
+# one when you want a GGUF, not the fast path (that one is ../qwen3.8-flash-next).
 #
-# Build the image first (llama.cpp PR #28243, pinned commit, sm120 only):
-#   git clone https://github.com/danielhanchen/llama.cpp llama.cpp-mtp
-#   git -C llama.cpp-mtp checkout 2857e51143bd88ec6fc0246246f42a5d0394d98a
-#   docker build --target server --build-arg CUDA_DOCKER_ARCH=120 \
-#     -t qwen-pedia/fnext-llamacpp-mtp:r1 -f llama.cpp-mtp/.devops/cuda.Dockerfile llama.cpp-mtp
+# Build the image first from the Dockerfile in this directory (llama.cpp PR #28243, pinned commit, sm120 only):
+#   docker build -t qwen-pedia/fnext-llamacpp-mtp:r1 .
 #
 # Weights (the head is a separate file; the trunk shards did not change):
 #   hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
