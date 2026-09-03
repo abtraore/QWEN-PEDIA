@@ -1,5 +1,7 @@
 # QWEN-PEDIA
 
+![QWEN-PEDIA on RTX 5090](social-preview.png)
+
 A hub for fast, verified Qwen serving recipes on consumer hardware. Every
 number here was measured on real machines with the exact commands published
 next to it. No screenshots without flags, no "trust me" throughput.
