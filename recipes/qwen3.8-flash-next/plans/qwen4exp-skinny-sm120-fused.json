@@ -1,0 +1,278 @@
+{
+ "24x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 128,
+   "outputs_per_block": 2,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 32,
+   "outputs_per_block": 1,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 2,
+   "k_unroll": 2,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 128,
+   "outputs_per_block": 1,
+   "k_unroll": 4,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "16": {
+   "num_rows": 16,
+   "block_size": 128,
+   "outputs_per_block": 1,
+   "k_unroll": 4,
+   "vector_width": 4,
+   "static_k": 2560
+  }
+ },
+ "320x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 128,
+   "outputs_per_block": 1,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 2560
+  }
+ },
+ "336x10240": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 256,
+   "outputs_per_block": 3,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 10240
+  }
+ },
+ "640x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 2560
+  }
+ },
+ "2560x1536": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 128,
+   "outputs_per_block": 2,
+   "k_unroll": 4,
+   "vector_width": 4,
+   "static_k": 1536
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 1536
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 1536
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 1536
+  },
+  "16": {
+   "num_rows": 16,
+   "block_size": 32,
+   "outputs_per_block": 2,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 1536
+  }
+ },
+ "3584x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 64,
+   "outputs_per_block": 2,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 32,
+   "outputs_per_block": 2,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "16": {
+   "num_rows": 16,
+   "block_size": 32,
+   "outputs_per_block": 2,
+   "k_unroll": 4,
+   "vector_width": 4,
+   "static_k": 2560
+  }
+ },
+ "4096x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 128,
+   "outputs_per_block": 2,
+   "k_unroll": 2,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 64,
+   "outputs_per_block": 2,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 2560
+  }
+ },
+ "62080x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 2,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 32,
+   "outputs_per_block": 1,
+   "k_unroll": 4,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 1,
+   "k_unroll": 1,
+   "vector_width": 4,
+   "static_k": 2560
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 32,
+   "outputs_per_block": 1,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 2560
+  }
+ },
+ "320x10240": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 128,
+   "outputs_per_block": 4,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 10240
+  }
+ },
+ "4120x2560": {
+  "1": {
+   "num_rows": 1,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "2": {
+   "num_rows": 2,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 2,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "4": {
+   "num_rows": 4,
+   "block_size": 64,
+   "outputs_per_block": 4,
+   "k_unroll": 4,
+   "vector_width": 8,
+   "static_k": 2560
+  },
+  "8": {
+   "num_rows": 8,
+   "block_size": 64,
+   "outputs_per_block": 2,
+   "k_unroll": 1,
+   "vector_width": 8,
+   "static_k": 2560
+  }
+ }
+}

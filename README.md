@@ -21,8 +21,8 @@ recipe.
 
 | model | engine | hardware | context | decode | prefill @depth | KV pool | recipe |
 |---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next (NVFP4) | vLLM nightly 27a94d1 + overlay r9 | 4x 5090 | 393,216 (YaRN 1.5) | 296-303 tok/s on code, 95 engine steps/s | ~3,200 tok/s @36K-100K | 736,359 tok | [recipe](recipes/qwen3.8-flash-next/) |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL GGUF) | llama.cpp PR #28243 + Unsloth MTP head | 4x 5090 | 131,072 | 130-156 tok/s on code (n-max 2-3), 218 on copy-heavy edits | 1,456-1,712 tok/s @4K | 1 slot x 131,072 | [recipe](recipes/qwen3.8-flash-next-gguf/) |
-| Qwen3.8-Flash-Next (NVFP4) | vLLM nightly + patches | 4x 5090 | 393,216 (YaRN 1.5) | 203-211 tok/s, flat to 186K | 2,350-2,690 tok/s | 786,432 tok | [recipe](recipes/qwen3.8-flash-next/) |
 | Qwen3.8-27B (NVFP4) | vLLM v0.28.0, no patches | 2x 5090 | 262,144 native | 157 tok/s (212-236 on code) | 4,600-5,050 tok/s | 833,295 tok | [recipe](recipes/qwen3.8-27b/) |
 
 Decode is single-stream on code-shaped prompts, greedy, warmup discarded.
@@ -59,6 +59,13 @@ upstream thread and retires when the fix merges.
 
 The findings behind these recipes are contributed back where they belong:
 
+- 2026-09-05, in the recipe, not yet filed: sm120 skinny GEMM plan table for the Qwen4Exp dense projections, opening upstream's CuTe DSL low-latency kernel (normally gated to sm90/sm103) to sm120
+- 2026-09-05, in the recipe, not yet filed: local-argmax draft sampling for the Flash-Next MTP head, gathering (value, id) pairs from the local vocab shard instead of moving the full logits tensor per draft step
+- 2026-09-05, in the recipe, not yet filed: custom IPC all-gather routing for the target's logits gather, reusing vLLM's existing custom-all-reduce buffers for a collective NCCL was handling before
+- 2026-09-05, in the recipe, not yet filed: fused GDN qkvz+ba input projection, merging two per-layer GEMMs into one on all Gated DeltaNet layers
+- 2026-09-05, in the recipe, not yet filed: FlashInfer all-reduce sm120 table and RDMA-flag fixes, adding a compute-capability-120 entry to vLLM's FlashInfer all-reduce size tables and gating FlashInfer's GPUDirect RDMA flag on the device actually supporting it
+- 2026-09-05, in the recipe, not yet filed: custom all-reduce PCIe gate, allowing vLLM's one-shot IPC all-reduce kernel on more than two PCIe-only GPUs when NVML reports no NVLink on any pair
+- 2026-09-05, in the recipe, not yet filed: three mixed-precision loader fixes for nvidia's Qwen3.8-Flash-Next-NVFP4 checkpoint (FP8 PLE table support in mixed ModelOpt checkpoints, the MTP layer-index remap for the quantized-layers map, and FP8_BLOCK_SCALES routed experts routed to vLLM's block-FP8 MoE method)
 - 2026-08-28 [vllm-project/recipes#870](https://github.com/vllm-project/recipes/pull/870): Flash-Next verified at 200 tok/s decode on 4x RTX 5090, with the sm120 knobs explained
 - 2026-08-28 [vllm-project/vllm#54275](https://github.com/vllm-project/vllm/pull/54275): fix for the kv-cache-memory advisory that OOMs when other processes hold GPU memory
 - 2026-08-28 [fp8 KV for QSA](https://gist.github.com/abtraore/329547468a6eb04ecedac38250148093), offered on [vllm#53896](https://github.com/vllm-project/vllm/pull/53896): pool +78%, outputs md5-identical to bf16
