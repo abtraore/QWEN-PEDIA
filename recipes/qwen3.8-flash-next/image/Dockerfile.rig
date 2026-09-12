@@ -1,7 +1,0 @@
-# Flash-Next port image: vLLM nightly 27a94d1 (2026-09-03, qwen4_exp layout, pinned digest) + PR #54873
-# (QSA sparse GQA) + PR #54129 (mmap-backed PLE) as their three-dot diffs + saturn patches (fp8 QSA
-# main-KV, fused multi-step draft, eagle block-drop ablation, custom-AR PCIe gate, FlashInfer AR sm120
-# table + RDMA flag). Python-only overlay, no recompilation.
-FROM vllm/vllm-openai@sha256:7d5128a92db05e6d70661a18f10e40c17cd2d8fcaad9226e170a0d69f822b795
-COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
-COPY flashinfer/ /usr/local/lib/python3.12/dist-packages/flashinfer/

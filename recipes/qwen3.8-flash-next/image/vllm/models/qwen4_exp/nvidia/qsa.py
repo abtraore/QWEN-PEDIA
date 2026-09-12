@@ -11,6 +11,7 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -29,10 +30,6 @@ from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 from vllm.utils.torch_utils import (
-    LayerNameType,
-    _encode_layer_name,
-    _resolve_layer_name,
-    direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -155,7 +152,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
-        is_prefill: bool,
+        use_prefill_config: bool,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -205,7 +202,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
-            is_prefill,
+            use_prefill_config,
             output[:num_tokens],
             k_scale=k_scale,
             v_scale=v_scale,
@@ -259,6 +256,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.total_num_heads % tp_size:
             raise ValueError("QSA attention heads must be divisible by TP size")
         self.num_heads = self.total_num_heads // tp_size
+        # Decode/verify batches have at most 1 + num_spec query tokens per
+        # request; use_prefill_config (max_query_len > this) steers the
+        # config table. Shorter batches take the decode profile — harmless,
+        # the difference is tile-shape tuning, not correctness.
         self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_kv_heads >= tp_size:
@@ -396,9 +397,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+    @eager_break_during_capture
     def _run_qsa(
         self,
-        hidden_states: torch.Tensor,
+        projected_qk: torch.Tensor,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -423,7 +425,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
         selected = self.indexer(
-            hidden_states,
+            projected_qk,
             positions,
             self.topk_indices_buffer[:num_tokens],
         )
@@ -446,7 +448,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
-            is_prefill=main_metadata.max_query_len > self._max_decode_query_len,
+            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
         )
 
     def forward(
@@ -461,27 +463,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         attn_output = torch.empty_like(query)
-        encoded_layer_name = _encode_layer_name(self.layer_name)
-        if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
-        else:
-            qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
+        # Keep the index projection outside the eager break.
+        projected_qk, _ = self.indexer.index_qk_proj(hidden_states)
+        self._run_qsa(
+            projected_qk,
+            positions,
+            query,
+            key,
+            value,
+            attn_output,
+        )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
             flat_output = flat_output * torch.sigmoid(gate)
@@ -489,55 +480,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
-def qwen4_exp_qsa_with_output(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    """Run the complete QSA state/update/attend transaction."""
-
-    layer_name = _resolve_layer_name(layer_name)
-    layer = get_forward_context().no_compile_layers[layer_name]
-    if not isinstance(layer, Qwen4ExpQSAAttention):
-        raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")
-    layer._run_qsa(
-        hidden_states,
-        positions,
-        query,
-        key,
-        value,
-        output,
-    )
-
-
-def qwen4_exp_qsa_with_output_fake(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_qsa_with_output",
-    op_func=qwen4_exp_qsa_with_output,
-    mutates_args=["output"],
-    fake_impl=qwen4_exp_qsa_with_output_fake,
-)
-
-
 __all__ = [
     "QSAIndexer",
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSAFlashAttentionBackend",
     "Qwen4ExpQSAFlashAttentionImpl",
-    "qwen4_exp_qsa_with_output",
 ]

@@ -1,7 +1,7 @@
-# Qwen3.8-Flash-Next on 4x RTX 5090 (build r9)
+# Qwen3.8-Flash-Next on 4x RTX 5090 (build r10)
 
-The 176B/6B-active Qwen4 preview (`qwen4_exp` architecture) at **95 engine
-steps/s**, **296-303 tok/s decode on code**, prefill about **3,200 tok/s at
+The 176B/6B-active Qwen4 preview (`qwen4_exp` architecture) at **106 engine
+steps/s**, **319-331 tok/s decode on code**, prefill about **7,800 tok/s at
 both 36K and 100K depth**, with a **736,359-token KV pool** at the default
 393,216-token YaRN context. Boot takes about **10 minutes**. Built here from
 a pinned nightly digest with the overlay applied as plain Python files, so
@@ -46,7 +46,7 @@ slower on the same cards) is `../qwen3.8-flash-next-gguf/`.
 
 ```bash
 git clone https://github.com/abtraore/QWEN-PEDIA && cd QWEN-PEDIA/recipes/qwen3.8-flash-next
-docker build -t qwen-pedia/fnext-vllm:r9 .
+docker build -t qwen-pedia/fnext-vllm:r10 .
 ./launch.sh
 ```
 
@@ -157,3 +157,24 @@ or more) where these GEMMs become bandwidth-bound instead of launch-bound.
   that cannot run the vLLM overlay.
 - `NOTES.md`: field notes, the decode-step profile, dead ends, the skinny
   GEMM tuner, and how to verify a boot.
+
+## r10 (2026-09-12): rebase onto nightly eed1f3d0
+
+Same overlay rebased onto the 2026-09-12 nightly. Upstream now carries the FlashInfer GDN prefill
+kernel on SM12x (#55715), which is where the prefill jump comes from (3,200 to 7,800 tok/s: the 36
+GDN layers ran a Triton fallback before), the FP8 indexer cache (#54890), no torch.compile on the
+NVIDIA path (#55272), the block-FP8 MTP fixes (#55513) and UVA PLE offload (#54371). Measured on
+the same rig and prompts as r9:
+
+| | r9 (09-05) | r10 (09-12) |
+|---|---|---|
+| engine steps/s | 95.1 to 95.5 | 105.7 to 106.0 |
+| decode on code, tok/s | 296 to 303 | 319 to 331 |
+| prefill at 36K / 100K, tok/s | 3,218 / 3,185 | 7,841 / 7,767 |
+| needle at 50 percent of 336K | found, 129 s | found, 46 s |
+| KV pool at 393,216 context | 736,359 | 736,359 |
+
+The n-gram table is now served by upstream's UVA offload (`--engram-config '{"cpu_offload": true}'`,
+pinned host memory, the GPU reads rows directly); the mmap, prewarm and mlock path of r9 is gone.
+Four r9 patches retired upstream (QSA sparse GQA, FP8 PLE in mixed checkpoints, block-FP8 MTP
+experts, the MTP per-layer algo remap). The r9 overlay stays in git history for the 27a94d1 nightly.

@@ -21,7 +21,7 @@ recipe.
 
 | model | engine | hardware | context | decode | prefill @depth | KV pool | recipe |
 |---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next (NVFP4) | vLLM nightly 27a94d1 + overlay r9 | 4x 5090 | 393,216 (YaRN 1.5) | 296-303 tok/s on code, 95 engine steps/s | ~3,200 tok/s @36K-100K | 736,359 tok | [recipe](recipes/qwen3.8-flash-next/) |
+| Qwen3.8-Flash-Next (NVFP4) | vLLM nightly eed1f3d0 + overlay r10 | 4x 5090 | 393,216 (YaRN 1.5) | 319-331 tok/s on code, 106 engine steps/s | ~7,800 tok/s @36K-100K | 736,359 tok | [recipe](recipes/qwen3.8-flash-next/) |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL GGUF) | llama.cpp PR #28243 + Unsloth MTP head | 4x 5090 | 131,072 | 130-156 tok/s on code (n-max 2-3), 218 on copy-heavy edits | 1,456-1,712 tok/s @4K | 1 slot x 131,072 | [recipe](recipes/qwen3.8-flash-next-gguf/) |
 | Qwen3.8-27B (NVFP4) | vLLM v0.28.0, no patches | 2x 5090 | 262,144 native | 157 tok/s (212-236 on code) | 4,600-5,050 tok/s | 833,295 tok | [recipe](recipes/qwen3.8-27b/) |
 

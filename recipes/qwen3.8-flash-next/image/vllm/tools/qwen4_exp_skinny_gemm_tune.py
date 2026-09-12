@@ -4,7 +4,7 @@
 Run INSIDE the serving image on a free GPU (needs cuteDSL + quack):
 
     docker run --rm --gpus '"device=4"' -v "$PWD/plans":/patches \\
-        --entrypoint python3 qwen-pedia/fnext-vllm:r9 \\
+        --entrypoint python3 qwen-pedia/fnext-vllm:r10 \\
         /usr/local/lib/python3.12/dist-packages/vllm/tools/qwen4_exp_skinny_gemm_tune.py \\
         --out /patches/qwen4exp-skinny-sm120.json
 
