@@ -1,0 +1,73 @@
+From 057995f4ededeb29731c41dfe14abb6dbd71beeb Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Fri, 18 Sep 2026 02:01:48 +0000
+Subject: [PATCH 1/4] saturn: GGML_CUDA_LAUNCH_STATS launch histogram per graph
+ (fusion measurement aid)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7536a5d2a..b2ecde1ad 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3282,6 +3282,24 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++
++// saturn: per-graph launch statistics (GGML_CUDA_LAUNCH_STATS=1 prints a histogram of launched
++// nodes, fused chains counted once, every 200 graph computes). Measurement aid for the fusion work.
++#include <map>
++namespace saturn_stats {
++    static bool enabled() { static bool e = getenv("GGML_CUDA_LAUNCH_STATS") != nullptr; return e; }
++    static std::map<std::string, long> hist; static long graphs = 0; static long launches = 0;
++    static void note(const std::string & key) { hist[key]++; launches++; }
++    static void end_graph() {
++        graphs++;
++        if (graphs % 200 != 0) return;
++        GGML_LOG_INFO("saturn_stats: %ld graphs, %.1f launches/graph\n", graphs, (double) launches / graphs);
++        std::vector<std::pair<long, std::string>> v; for (auto & kv : hist) v.push_back({kv.second, kv.first});
++        std::sort(v.rbegin(), v.rend());
++        for (size_t k = 0; k < v.size() && k < 40; ++k)
++            GGML_LOG_INFO("saturn_stats:   %8.1f  %s\n", (double) v[k].first / graphs, v[k].second.c_str());
++    }
++}
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4384,6 +4402,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (saturn_stats::enabled()) {
++                        std::string key = "FUSED";
++                        for (int k = 0; k <= nodes_to_skip; ++k) { key += k ? "+" : " "; key += ggml_op_name(cgraph->nodes[i + k]->op); }
++                        saturn_stats::note(key);
++                    }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -4455,6 +4478,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                if (saturn_stats::enabled() && !(ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
++                        node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE)) {
++                    saturn_stats::note(ggml_op_name(node->op));
++                }
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -4465,6 +4492,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     try_launch_concurrent_event(node);
+                }
+             }
++            if (saturn_stats::enabled()) saturn_stats::end_graph();
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+-- 
+2.53.0
+

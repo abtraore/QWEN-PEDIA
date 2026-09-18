@@ -1,0 +1,408 @@
+From 96555f2d59274b8149ef2b7a072a20d142706fe9 Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Fri, 18 Sep 2026 18:55:54 +0000
+Subject: [PATCH 4/4] saturn: decode launch reductions for Qwen3.5 ternary
+ (Bonsai 27B)
+
+- relax the gate/up/GLU fusion memory check on the quantized matvec path: the kernel reads a private q8_1 copy of
+  src1, so a GLU output placed on src1's memory is harmless. 24 of 64 ffn layers were refused before (default on,
+  GGML_CUDA_FUSE_GLU_RELAXED=0 to disable)
+- dual-output matvec: two batch-1 MUL_MATs on the same input with same-shape weights run as one launch (ssm_alpha +
+  ssm_beta, attn_k + attn_v). mmvf and mmvq epilogues write the second result to fusion.dst2 (default on,
+  GGML_CUDA_FUSE_DUAL_MATVEC=0 to disable)
+- per-graph q8_1 activation cache in a persistent arena, keyed on the view root (opt-in GGML_CUDA_MMVQ_SHARE_Q8=1)
+- experiment switches for the PQ2_0 block geometry (GGML_CUDA_PQ2_WIDE, GGML_CUDA_PQ2_SMALLK): flat on sm120
+- launch statistics name unfused GLU nodes and report q8 cache hits
+
+Decode graph 1542 -> 1430 launches, 7.22 -> 7.08 ms/token on one RTX 5090, output identical (sha e3edc1330e4f).
+---
+ ggml/src/ggml-cuda/common.cuh   | 16 ++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 90 +++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/mmvf.cu      |  8 +++
+ ggml/src/ggml-cuda/mmvq.cu      | 75 +++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/pq2-gemv.cuh |  2 +-
+ 5 files changed, 181 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index ef929d3d7..b8f202339 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1465,6 +1465,18 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // saturn: per-graph cache of q8_1-quantized batch-1 activations. Several mmvq consumers often read the
++    // SAME tensor (qkv + gate, q + k/v, ...) and each used to launch its own quantize kernel (~2.6 us,
++    // launch-bound). Entries live in a small persistent arena (not the scratch pool: that one is
++    // stack-like and a cached buffer would break its LIFO free order). Reset at the start of every
++    // graph evaluation; addresses are stable, so captured CUDA graphs replay correctly.
++    struct saturn_q8_entry { const ggml_tensor * src1; const void * src_data; int type; char * data; size_t size; };
++    long saturn_q8_hits = 0;
++    std::vector<saturn_q8_entry> saturn_q8_cache;
++    char * saturn_q8_arena      = nullptr;
++    size_t saturn_q8_arena_size = 0;
++    size_t saturn_q8_arena_used = 0;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+@@ -1580,6 +1592,9 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    // saturn: dual-output matvec. When set, `gate` is a SECOND weight applied to the same input and its
++    // result is written to dst2 instead of being combined through the GLU (two projections, one launch).
++    const ggml_tensor * dst2 = nullptr;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+@@ -1588,6 +1603,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    float * dst2 = nullptr; // saturn: dual-output matvec, see ggml_cuda_mm_fusion_args_host
+ };
+ 
+ struct ggml_cuda_kernel_launch_params {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7c6d8cd69..258454259 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -707,6 +707,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (saturn_q8_arena != nullptr) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaFree(saturn_q8_arena));
++        saturn_q8_arena = nullptr;
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -2971,7 +2976,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                                                  const int           node_count,
+                                                  const int *         out_nodes,
+                                                  const int           out_count,
+-                                                 const bool          is_topk_moe = false) {
++                                                 const bool          is_topk_moe = false,
++                                                 const ggml_tensor * ignore_src  = nullptr) {
+     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+         const int64_t a_start = (int64_t) a->data;
+         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+@@ -3007,6 +3013,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                     continue;
+                 }
+ 
++                if (src == ignore_src) {
++                    continue; // saturn: caller guarantees the fused kernel never reads this tensor (see mul_mat_glu_ops)
++                }
+                 if (nodes_overlap(dst, src)) {
+                     bool found = false;
+ 
+@@ -3072,7 +3081,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ 
+         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
+             int out_nodes[] = { node_idx + 2 };
+-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
++            // saturn: on the quantized matvec path (mmvq) the shared activation src1 is quantized into a
++            // private q8_1 pool buffer BEFORE the fused kernel is launched and the kernel reads only that
++            // copy plus the weights. ggml-alloc often places the GLU output on src1's memory (src1 dies at
++            // ffn_up), which made this check refuse the fusion on 24 of 64 layers of Ternary-Bonsai-2-27B.
++            // The float path (mmvf) reads src1 directly, so it keeps the strict check.
++            static const bool relaxed = getenv("GGML_CUDA_FUSE_GLU_RELAXED") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GLU_RELAXED")) != 0;
++            const ggml_tensor * ignore = nullptr;
++            if (relaxed && ops.begin()[0] == GGML_OP_MUL_MAT && ffn_up->src[1] == ffn_gate->src[1] &&
++                ggml_cuda_should_fuse_mul_mat_vec_q(ffn_up) && !ggml_cuda_should_fuse_mul_mat_vec_f(ffn_up)) {
++                ignore = ffn_up->src[1];
++            }
++            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false, ignore);
+         }
+     }
+ 
+@@ -3297,7 +3317,7 @@ namespace saturn_stats {
+             GGML_LOG_WARN("saturn_stats: graph with %ld launches\n", launches);
+             std::vector<std::pair<long, std::string>> v; for (auto & kv : hist) v.push_back({kv.second, kv.first});
+             std::sort(v.rbegin(), v.rend());
+-            for (size_t k = 0; k < v.size() && k < 40; ++k)
++            for (size_t k = 0; k < v.size() && k < 140; ++k)
+                 GGML_LOG_WARN("saturn_stats:   %6ld  %s\n", v[k].first, v[k].second.c_str());
+             last_printed = launches;
+         }
+@@ -4155,6 +4175,53 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    // saturn: dual-output matvec. Two batch-1 MUL_MATs that read the SAME input through same-shape,
++    // same-type weights and are separated only by no-op nodes (reshape/view of the first result) run as
++    // one launch: ssm_alpha + ssm_beta (bf16, 48 rows, launch-bound at ~4 us each) and attn_k + attn_v on
++    // Qwen3.5. Placed last so it never takes a pair that belongs to the gate/up/GLU fusion.
++    static const bool dual_matvec = getenv("GGML_CUDA_FUSE_DUAL_MATVEC") == nullptr || std::atoi(getenv("GGML_CUDA_FUSE_DUAL_MATVEC")) != 0;
++    if (dual_matvec && node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1) {
++        const auto is_noop = [](const ggml_tensor * t) {
++            return ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
++                   t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE;
++        };
++        int j = i + 1;
++        while (j < cgraph->n_nodes && j - i <= 4 && is_noop(cgraph->nodes[j])) {
++            ++j;
++        }
++        ggml_tensor * other = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
++        if (other && other->op == GGML_OP_MUL_MAT && other->src[1] == node->src[1] && other != node->src[1] &&
++            other->src[0]->type == node->src[0]->type && ggml_are_same_shape(other->src[0], node->src[0]) &&
++            ggml_are_same_stride(other->src[0], node->src[0]) && ggml_are_same_shape(other, node) &&
++            other->src[0]->op == GGML_OP_NONE && node->src[0]->op == GGML_OP_NONE) {
++            const bool use_q = ggml_cuda_should_fuse_mul_mat_vec_q(node) && ggml_cuda_should_fuse_mul_mat_vec_q(other);
++            const bool use_f = !use_q && ggml_cuda_should_fuse_mul_mat_vec_f(node) && ggml_cuda_should_fuse_mul_mat_vec_f(other);
++            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++                const int64_t a0 = (int64_t) a->data, a1 = a0 + (int64_t) ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++                const int64_t b0 = (int64_t) b->data, b1 = b0 + (int64_t) ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++                return a0 < b1 && b0 < a1;
++            };
++            // the two results must be distinct; the float kernel reads src1 while it writes, the quantized
++            // one only reads its private q8_1 copy
++            bool mem_ok = !overlap(node, other);
++            if (use_f) {
++                mem_ok = mem_ok && !overlap(node, node->src[1]) && !overlap(other, node->src[1]);
++            }
++            if ((use_q || use_f) && mem_ok) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.gate   = other->src[0];
++                fusion_data.dst2   = other;
++                fusion_data.glu_op = GGML_GLU_OP_SWIGLU; // unused in dual-output mode
++                if (use_q) {
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
++                } else {
++                    ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
++                }
++                return j - i;
++            }
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -4177,6 +4244,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         int remaining = 0;
+     };
+     std::vector<gb10_shared_q8_entry> gb10_shared_q8;
++    // saturn: the batch-1 q8_1 cache is valid for one graph evaluation only
++    cuda_ctx->saturn_q8_cache.clear();
++    cuda_ctx->saturn_q8_arena_used = 0;
+ 
+     struct gb10_virtual_rms_entry {
+         const ggml_tensor * normalized;
+@@ -4484,7 +4554,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 if (saturn_stats::enabled() && !(ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+                         node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE)) {
+-                    saturn_stats::note(ggml_op_name(node->op));
++                    if (node->op == GGML_OP_GLU) {
++                        saturn_stats::note(std::string("GLU ") + node->name); // which layers miss the MUL_MAT+MUL_MAT+GLU fusion
++                    } else {
++                        saturn_stats::note(ggml_op_name(node->op));
++                    }
+                 }
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+@@ -4496,7 +4570,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     try_launch_concurrent_event(node);
+                }
+             }
+-            if (saturn_stats::enabled()) saturn_stats::end_graph();
++            if (saturn_stats::enabled()) {
++                if (cuda_ctx->saturn_q8_hits) {
++                    GGML_LOG_WARN("saturn_stats: q8 cache: %zu entries, %ld hits this graph\n", cuda_ctx->saturn_q8_cache.size(), cuda_ctx->saturn_q8_hits);
++                }
++                saturn_stats::end_graph();
++            }
++            cuda_ctx->saturn_q8_hits = 0;
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b99..31b3ea132 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -354,6 +354,9 @@ static __global__ void mul_mat_vec_f(
+             if (use_gate_bias) {
+                 gate_value += gate_bias[tid*stride_col_dst + row];
+             }
++            if (fusion.dst2) {
++                fusion.dst2[tid*stride_col_dst + row] = gate_value; // saturn: dual-output, no GLU
++            } else {
+             switch (glu_op) {
+                 case GGML_GLU_OP_SWIGLU:
+                     value *= ggml_cuda_op_silu_single(gate_value);
+@@ -368,6 +371,7 @@ static __global__ void mul_mat_vec_f(
+                 default:
+                     break;
+             }
++            }
+         }
+     }
+ 
+@@ -675,6 +679,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        if (fusion->dst2) {
++            GGML_ASSERT(fusion->gate && !ids && fusion->dst2->type == GGML_TYPE_F32 && ggml_are_same_shape(fusion->dst2, dst));
++            fusion_local.dst2 = (float *) fusion->dst2->data;
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index de3e9f5f9..f5634bb4e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -7,6 +7,10 @@
+ #include <cstdint>
+ #include <type_traits>
+ 
++#ifndef SATURN_PQ2_ALT_NWARPS
++#define SATURN_PQ2_ALT_NWARPS 8
++#endif
++
+ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+ 
+ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+@@ -406,6 +410,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ 
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
++        // saturn experiment (GGML_CUDA_PQ2_WIDE): alternative warps-per-block for PQ2_0 batch-1, selected through halve_iters
++        if (type == GGML_TYPE_PQ2_0 && ncols_dst == 1 && !small_k && halve_iters) {
++            return SATURN_PQ2_ALT_NWARPS;
++        }
+         switch (ncols_dst) {
+             case 1:
+             case 2:
+@@ -819,6 +827,9 @@ static __global__ void mul_mat_vec_q(
+                             gate_value *= gate_scales;
+                         }
+                         gate_value += gate_biases[j];
++                        if (fusion.dst2) { // saturn: dual-output, no GLU (single channel/sample, checked on the host)
++                            fusion.dst2[row0 + j*stride_col_dst + i] = gate_value;
++                        } else
+                         switch (active_glu) {
+                             case GGML_GLU_OP_SWIGLU:
+                                 result *= ggml_cuda_op_silu_single(gate_value);
+@@ -1072,6 +1083,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ 
+     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
+     const auto should_halve_iters = [&] {
++        // saturn experiment: the wider block (2x nwarps, half the K iterations) for PQ2_0 batch-1 on the generic
++        // table. GGML_CUDA_PQ2_WIDE=1 all shapes, =2 only when it removes a mostly idle last K iteration.
++        static const int pq2_wide = getenv("GGML_CUDA_PQ2_WIDE") ? atoi(getenv("GGML_CUDA_PQ2_WIDE")) : 0;
++        if (pq2_wide && type == GGML_TYPE_PQ2_0 && table_id == MMVQ_PARAMETERS_GENERIC && !has_ids) {
++            if (pq2_wide == 1) {
++                return true;
++            }
++            const int bpi = calc_nwarps(type, 1, table_id) * blocks_per_iter_1warp;
++            return blocks_per_row_x <= 2 * bpi; // k <= 8192: one iteration instead of two
++        }
+         if (table_id != MMVQ_PARAMETERS_GB10) {
+             return false;
+         }
+@@ -1428,6 +1449,11 @@ void ggml_cuda_mul_mat_vec_q(
+             fusion_local.gate_scale = fusion->gate_scale->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        if (fusion->dst2) {
++            GGML_ASSERT(fusion->gate && !ids && fusion->dst2->type == GGML_TYPE_F32 && ggml_are_same_shape(fusion->dst2, dst));
++            GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
++            fusion_local.dst2 = (float *) fusion->dst2->data;
++        }
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+@@ -1442,12 +1468,53 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    const size_t  q8_size     = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
++    char * src1_q8_1_data = nullptr;
++    bool   need_quantize  = true;
+     {
++        // saturn: share the quantized activation between the batch-1 consumers of the same tensor
++        static const bool share_q8 = getenv("GGML_CUDA_MMVQ_SHARE_Q8") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_SHARE_Q8")) != 0; // opt-in: correct (64 hits/token on Bonsai 27B) but no measurable gain, launches overlap in-stream
++        constexpr size_t arena_size = 16u << 20;
++        if (share_q8 && !ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && ctx.curr_stream_no == 0 && ggml_is_contiguous(src1)) {
++            // consumers usually reach the shared activation through their own reshape/view, so key on the
++            // view ROOT (same logical value, SSA) plus the data pointer; never on the address alone, the
++            // allocator recycles memory within a graph
++            const ggml_tensor * q8_root = src1;
++            while (q8_root->view_src) {
++                q8_root = q8_root->view_src;
++            }
++            for (const auto & e : ctx.saturn_q8_cache) {
++                if (e.src1 == q8_root && e.src_data == src1->data && e.type == (int) src0->type && e.size == q8_size) {
++                    ++ctx.saturn_q8_hits;
++                    src1_q8_1_data = e.data;
++                    need_quantize  = false;
++                    break;
++                }
++            }
++            if (!src1_q8_1_data) {
++                if (ctx.saturn_q8_arena == nullptr) {
++                    ggml_cuda_set_device(ctx.device);
++                    CUDA_CHECK(cudaMalloc((void **) &ctx.saturn_q8_arena, arena_size));
++                    ctx.saturn_q8_arena_size = arena_size;
++                }
++                const size_t aligned = GGML_PAD(q8_size, 64);
++                if (ctx.saturn_q8_arena_used + aligned <= ctx.saturn_q8_arena_size) {
++                    src1_q8_1_data = ctx.saturn_q8_arena + ctx.saturn_q8_arena_used;
++                    ctx.saturn_q8_arena_used += aligned;
++                    ctx.saturn_q8_cache.push_back({ q8_root, src1->data, (int) src0->type, src1_q8_1_data, q8_size });
++                }
++            }
++        }
++        if (!src1_q8_1_data) {
++            src1_q8_1_data = src1_q8_1_pool.alloc(q8_size);
++        }
++    }
++    if (need_quantize) {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_data, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1474,12 +1541,12 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     // saturn: purpose-built batch-1 ternary GEMV (GGML_CUDA_PQ2_GEMV=1), see pq2-gemv.cuh
+     if (src0->type == GGML_TYPE_PQ2_0 &&
+-        ggml_cuda_pq2_gemv_try(src0->data, src1_q8_1.get(), fusion_local, dst_d, ne00, ne01, s01, ncols_dst,
++        ggml_cuda_pq2_gemv_try(src0->data, src1_q8_1_data, fusion_local, dst_d, ne00, ne01, s01, ncols_dst,
+                                nchannels_dst, ne3, ids != nullptr, stream)) {
+         return;
+     }
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1_data, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+diff --git a/ggml/src/ggml-cuda/pq2-gemv.cuh b/ggml/src/ggml-cuda/pq2-gemv.cuh
+index 3de67779e..205dffd53 100644
+--- a/ggml/src/ggml-cuda/pq2-gemv.cuh
++++ b/ggml/src/ggml-cuda/pq2-gemv.cuh
+@@ -157,7 +157,7 @@ static bool ggml_cuda_pq2_gemv_try(
+     if (((uintptr_t) vx & 15) || ((uintptr_t) vy & 15) || (fusion.gate && ((uintptr_t) fusion.gate & 15))) {
+         return false;
+     }
+-    if (fusion.x_scale || fusion.gate_scale) {
++    if (fusion.x_scale || fusion.gate_scale || fusion.dst2) {
+         return false;
+     }
+     const uint32_t nchunks  = ncols_x / 1024;
+-- 
+2.53.0
+

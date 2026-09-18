@@ -21,6 +21,7 @@ recipe.
 
 | model | engine | hardware | context | decode | prefill @depth | KV pool | recipe |
 |---|---|---|---|---|---|---|---|
+| Qwen3.8-27B ternary, Bonsai 2 (PQ2_0 GGUF, 1.72 bpw) | llama.cpp, PrismML fork 5d80cff0 + 4 patches | 1x 5090 | 262,144 native | 139-141 tok/s on code, 540 on copy-heavy edits (n-gram drafts, thinking off) | 3,445 tok/s @30K, 2,303 @100K | 1 slot x 262,144 | [recipe](recipes/qwen3.8-27b-ternary-gguf/) |
 | Qwen3.8-Flash-Next (NVFP4) | vLLM nightly eed1f3d0 + overlay r10 | 4x 5090 | 393,216 (YaRN 1.5) | 319-331 tok/s on code, 106 engine steps/s | ~7,800 tok/s @36K-100K | 736,359 tok | [recipe](recipes/qwen3.8-flash-next/) |
 | Qwen3.8-Flash-Next (UD-Q4_K_XL GGUF) | llama.cpp PR #28243 + Unsloth MTP head | 4x 5090 | 131,072 | 130-156 tok/s on code (n-max 2-3), 218 on copy-heavy edits | 1,456-1,712 tok/s @4K | 1 slot x 131,072 | [recipe](recipes/qwen3.8-flash-next-gguf/) |
 | Qwen3.8-27B (NVFP4) | vLLM v0.28.0, no patches | 2x 5090 | 262,144 native | 157 tok/s (212-236 on code) | 4,600-5,050 tok/s | 833,295 tok | [recipe](recipes/qwen3.8-27b/) |
@@ -59,6 +60,8 @@ upstream thread and retires when the fix merges.
 
 The findings behind these recipes are contributed back where they belong:
 
+- 2026-09-19, in the recipe, not yet filed: llama.cpp CUDA gate/up/GLU fusion refused on 24 of 64 layers of a Qwen3.5-architecture model because the graph allocator places the GLU output on the shared activation's memory; on the quantized matvec path the kernel only reads a private q8_1 copy, so the overlap check can ignore that tensor
+- 2026-09-19, in the recipe, not yet filed: dual-output matvec for llama.cpp's CUDA backend, running two batch-1 projections of the same input (`ssm_alpha`+`ssm_beta`, `attn_k`+`attn_v`) as one launch
 - 2026-09-05, in the recipe, not yet filed: sm120 skinny GEMM plan table for the Qwen4Exp dense projections, opening upstream's CuTe DSL low-latency kernel (normally gated to sm90/sm103) to sm120
 - 2026-09-05, in the recipe, not yet filed: local-argmax draft sampling for the Flash-Next MTP head, gathering (value, id) pairs from the local vocab shard instead of moving the full logits tensor per draft step
 - 2026-09-05, in the recipe, not yet filed: custom IPC all-gather routing for the target's logits gather, reusing vLLM's existing custom-all-reduce buffers for a collective NCCL was handling before

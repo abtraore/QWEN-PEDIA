@@ -1,0 +1,74 @@
+From 084910530746063e29d06e5d9f724e3216a41f6e Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Fri, 18 Sep 2026 02:07:31 +0000
+Subject: [PATCH 2/4] saturn: launch stats per captured graph, WARN level
+
+---
+ .dockerignore                   | 22 +---------------------
+ ggml/src/ggml-cuda/ggml-cuda.cu | 20 ++++++++++++--------
+ 2 files changed, 13 insertions(+), 29 deletions(-)
+
+diff --git a/.dockerignore b/.dockerignore
+index 0b81e83bf..cf1b29b89 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -1,22 +1,2 @@
+-*.o
+-*.a
+-.cache/
+-# Do not ignore .git directory, otherwise the reported build number will always be 0
+-.github/
+-.gitignore
+-.vs/
+-.vscode/
+-.DS_Store
+-
++.git
+ build*/
+-
+-tools/ui/node_modules/
+-
+-models/*
+-
+-/llama-cli
+-/llama-quantize
+-
+-arm_neon.h
+-compile_commands.json
+-Dockerfile
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b2ecde1ad..7c6d8cd69 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3288,16 +3288,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ #include <map>
+ namespace saturn_stats {
+     static bool enabled() { static bool e = getenv("GGML_CUDA_LAUNCH_STATS") != nullptr; return e; }
+-    static std::map<std::string, long> hist; static long graphs = 0; static long launches = 0;
++    static std::map<std::string, long> hist; static long launches = 0; static long last_printed = -1;
+     static void note(const std::string & key) { hist[key]++; launches++; }
++    // the eval loop only runs when a CUDA graph is (re)captured, so print the histogram of THIS graph
++    // whenever its launch count differs from the last printed one (one line set per graph shape)
+     static void end_graph() {
+-        graphs++;
+-        if (graphs % 200 != 0) return;
+-        GGML_LOG_INFO("saturn_stats: %ld graphs, %.1f launches/graph\n", graphs, (double) launches / graphs);
+-        std::vector<std::pair<long, std::string>> v; for (auto & kv : hist) v.push_back({kv.second, kv.first});
+-        std::sort(v.rbegin(), v.rend());
+-        for (size_t k = 0; k < v.size() && k < 40; ++k)
+-            GGML_LOG_INFO("saturn_stats:   %8.1f  %s\n", (double) v[k].first / graphs, v[k].second.c_str());
++        if (launches != last_printed) {
++            GGML_LOG_WARN("saturn_stats: graph with %ld launches\n", launches);
++            std::vector<std::pair<long, std::string>> v; for (auto & kv : hist) v.push_back({kv.second, kv.first});
++            std::sort(v.rbegin(), v.rend());
++            for (size_t k = 0; k < v.size() && k < 40; ++k)
++                GGML_LOG_WARN("saturn_stats:   %6ld  %s\n", v[k].first, v[k].second.c_str());
++            last_printed = launches;
++        }
++        hist.clear(); launches = 0;
+     }
+ }
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+-- 
+2.53.0
+

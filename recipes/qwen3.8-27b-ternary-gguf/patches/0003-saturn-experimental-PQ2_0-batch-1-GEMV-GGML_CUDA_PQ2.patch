@@ -1,0 +1,252 @@
+From f664c6a56bfc5c652d403432759dfdf45f71bb7d Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Fri, 18 Sep 2026 18:22:34 +0000
+Subject: [PATCH 3/4] saturn: experimental PQ2_0 batch-1 GEMV
+ (GGML_CUDA_PQ2_GEMV=1, default off), row-per-lane + K-chunks across warps,
+ 16-byte vector loads; correct to 1e-7 vs mmvq, currently slower (20.3 vs 17.0
+ us on 5120x17408). Also the env-gated small_k geometry experiment (no
+ effect).
+
+---
+ ggml/src/ggml-cuda/mmvq.cu      |  14 +++
+ ggml/src/ggml-cuda/pq2-gemv.cuh | 189 ++++++++++++++++++++++++++++++++
+ 2 files changed, 203 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/pq2-gemv.cuh
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index bf51b61e1..de3e9f5f9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2,6 +2,7 @@
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
++#include "pq2-gemv.cuh"
+ 
+ #include <cstdint>
+ #include <type_traits>
+@@ -1030,6 +1031,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         if (GGML_CUDA_CC_IS_CDNA(cc) && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0)) {
+             use = false;
+         }
++        // saturn experiment E2: one warp per row (rows_per_block = nwarps) for PQ2_0 batch-1 on the generic
++        // (sm120) table. The default geometry gives one row to 4 warps and leaves most threads idle on the
++        // second K iteration for k=5120 (40 blocks vs 32 per iteration). Env-gated for A/B.
++        static const int pq2_smallk = getenv("GGML_CUDA_PQ2_SMALLK") ? atoi(getenv("GGML_CUDA_PQ2_SMALLK")) : 0;
++        if (pq2_smallk && type == GGML_TYPE_PQ2_0 && table_id == MMVQ_PARAMETERS_GENERIC && c_ncols_dst == 1 && nwarps > 1) {
++            use = true;
++        }
+ 
+         constexpr std::array<ggml_type, 2> iq_slow_turing = {
+             GGML_TYPE_IQ3_XXS,
+@@ -1464,6 +1472,12 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // saturn: purpose-built batch-1 ternary GEMV (GGML_CUDA_PQ2_GEMV=1), see pq2-gemv.cuh
++    if (src0->type == GGML_TYPE_PQ2_0 &&
++        ggml_cuda_pq2_gemv_try(src0->data, src1_q8_1.get(), fusion_local, dst_d, ne00, ne01, s01, ncols_dst,
++                               nchannels_dst, ne3, ids != nullptr, stream)) {
++        return;
++    }
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/pq2-gemv.cuh b/ggml/src/ggml-cuda/pq2-gemv.cuh
+new file mode 100644
+index 000000000..3de67779e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pq2-gemv.cuh
+@@ -0,0 +1,189 @@
++#pragma once
++// saturn: purpose-built batch-1 GEMV for PQ2_0 (ternary g128, 34-byte blocks).
++//
++// Why: the generic mmvq template gives one output row to a whole block of threads, each thread
++// loading 8 bytes of weights and 32 bytes of the q8_1 activation at lane-dependent addresses, then
++// reduces across lanes and warps. Profile on sm120 (5120 x 17408): 66% DRAM throughput, 39x L1
++// traffic amplification from activation re-reads, barrier stalls from the cross-warp reduction.
++//
++// Here each lane owns a full output row (32 rows per warp, no reduction, no barrier). Rows are
++// streamed in chunks of 8 PQ2_0 blocks: 8 * 34 = 272 bytes, 16-byte aligned, so the chunk is read
++// with aligned int loads and the 16-bit fields (fp16 scale, 2-bit quant words) are cut out of them
++// with compile-time shifts. All lanes read the SAME activation addresses (broadcast-friendly).
++// The per-32-element arithmetic is identical to vec_dot_pq2_0_q8_1.
++//
++// Preconditions (checked by the host hook): ncols_x % 1024 == 0, contiguous rows, 16-byte aligned
++// weight and activation pointers, ncols_dst == 1, no ids.
++
++// One chunk = 8 PQ2_0 blocks = 272 bytes = 17 int4 vectors, against 32 q8_1 blocks = 1152 bytes =
++// 72 int4 vectors. Fully unrolled so every load is issued up front (hides DRAM latency) and every
++// field offset is a compile-time constant; 16-byte vector loads keep the load count at 89 per chunk
++// instead of 356 and the live-register count low (cut 2 with 4-byte loads: 103 registers/thread).
++static __device__ __forceinline__ int pq2_gemv_vcomp(const int4 & v, const int comp) {
++    return comp == 0 ? v.x : comp == 1 ? v.y : comp == 2 ? v.z : v.w;
++}
++
++static __device__ __forceinline__ float pq2_gemv_row_chunk(const int4 * GGML_CUDA_RESTRICT w, const int4 * GGML_CUDA_RESTRICT yv) {
++    float acc = 0.0f;
++#pragma unroll
++    for (int b = 0; b < 8; ++b) {
++        constexpr int ints_per_q8 = 9;                            // 4 bytes of ds + 32 bytes of qs
++        const int ob = 34 * b;                                    // byte offset of the block in the chunk
++        uint16_t dbits = (uint16_t) (((uint32_t) pq2_gemv_vcomp(w[ob >> 4], (ob >> 2) & 3)) >> (8 * (ob & 2)));
++        const float d2 = (float) reinterpret_cast<const half &>(dbits);
++#pragma unroll
++        for (int s = 0; s < 4; ++s) {                             // 32-element sub-chunk <-> one q8_1 block
++            const int ny = ints_per_q8 * (4 * b + s);             // int index of this q8_1 block in the y chunk
++            int sumi = 0;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int oq = ob + 2 + 8 * s + 2 * j;            // byte offset of this 16-bit quant word
++                const int q  = (int) ((((uint32_t) pq2_gemv_vcomp(w[oq >> 4], (oq >> 2) & 3)) >> (8 * (oq & 2))) & 0xFFFFu);
++                const int nu = ny + 1 + 2 * j;
++                const int u  = pq2_gemv_vcomp(yv[nu >> 2], nu & 3);
++                const int v  = pq2_gemv_vcomp(yv[(nu + 1) >> 2], (nu + 1) & 3);
++                const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
++                const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
++                const int qx = __byte_perm(qe, qo, 0x5140);
++                const int qy = __byte_perm(qe, qo, 0x7362);
++                sumi = ggml_cuda_dp4a(u, qx, sumi);
++                sumi = ggml_cuda_dp4a(v, qy, sumi);
++            }
++            uint16_t d8bits = (uint16_t) pq2_gemv_vcomp(yv[ny >> 2], ny & 3);
++            acc += d2 * (float) reinterpret_cast<const half &>(d8bits) * (float) sumi;
++        }
++    }
++    return acc;
++}
++
++// Block = NW warps x 32 lanes. Lane l of every warp works on row (block*32 + l); warp w takes the
++// K-chunks c with c % NW == w. One reduction over warps at the end (partial sums through shared
++// memory), then bias / GLU and the write, done by warp 0.
++template <int NW, bool has_gate>
++__launch_bounds__(NW * ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void pq2_gemv_rows(
++        const void * vx_ptr, const void * vgate_ptr, const void * vy_ptr, const float * x_bias_ptr,
++        const float * gate_bias_ptr, float * dst_ptr, const uint32_t nrows, const uint32_t nchunks,
++        const uint32_t row_ints, const int glu_op) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    const int           * GGML_CUDA_RESTRICT vx = (const int *) vx_ptr;
++    const block_q8_1    * GGML_CUDA_RESTRICT vy = (const block_q8_1 *) vy_ptr;
++    float               * GGML_CUDA_RESTRICT dst = dst_ptr;
++
++    ggml_cuda_pdl_sync();
++
++    const uint32_t row   = blockIdx.x * warp_size + threadIdx.x;
++    const bool     alive = row < nrows;
++    const uint32_t rowc  = alive ? row : 0;                      // dead lanes read row 0, result discarded
++
++    const int * GGML_CUDA_RESTRICT wrow = vx + (size_t) rowc * row_ints;
++    [[maybe_unused]] const int * GGML_CUDA_RESTRICT grow = nullptr;
++    if constexpr (has_gate) {
++        grow = ((const int *) vgate_ptr) + (size_t) rowc * row_ints;
++    }
++
++    float acc = 0.0f;
++    [[maybe_unused]] float acc_gate = 0.0f;
++    for (uint32_t c = threadIdx.y; c < nchunks; c += NW) {
++        acc += pq2_gemv_row_chunk((const int4 *) (wrow + c * 68), (const int4 *) (vy + c * 32)); // 272 B = 17 int4, 1152 B = 72 int4
++        if constexpr (has_gate) {
++            acc_gate += pq2_gemv_row_chunk((const int4 *) (grow + c * 68), (const int4 *) (vy + c * 32));
++        }
++    }
++
++    __shared__ float part[NW > 1 ? NW - 1 : 1][warp_size];
++    [[maybe_unused]] __shared__ float part_gate[(has_gate && NW > 1) ? NW - 1 : 1][warp_size];
++    if (threadIdx.y > 0) {
++        part[threadIdx.y - 1][threadIdx.x] = acc;
++        if constexpr (has_gate) {
++            part_gate[threadIdx.y - 1][threadIdx.x] = acc_gate;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0 || !alive) {
++        return;
++    }
++#pragma unroll
++    for (int l = 0; l < NW - 1; ++l) {
++        acc += part[l][threadIdx.x];
++        if constexpr (has_gate) {
++            acc_gate += part_gate[l][threadIdx.x];
++        }
++    }
++
++    float result = acc;
++    if (x_bias_ptr) {
++        result += x_bias_ptr[row];
++    }
++    if constexpr (has_gate) {
++        float gate_value = acc_gate;
++        if (gate_bias_ptr) {
++            gate_value += gate_bias_ptr[row];
++        }
++        switch ((ggml_glu_op) glu_op) {
++            case GGML_GLU_OP_SWIGLU:
++                result *= ggml_cuda_op_silu_single(gate_value);
++                break;
++            case GGML_GLU_OP_GEGLU:
++                result *= ggml_cuda_op_gelu_single(gate_value);
++                break;
++            case GGML_GLU_OP_SWIGLU_OAI:
++                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
++                break;
++            default:
++                result = result * gate_value;
++                break;
++        }
++    }
++    dst[row] = result;
++}
++
++// Host side: returns true when the fast path was taken.
++static bool ggml_cuda_pq2_gemv_try(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int64_t ncols_x, const int64_t nrows_x, const int64_t stride_row_x, const int64_t ncols_dst,
++        const int64_t nchannels_dst, const int64_t nsamples_dst, const bool has_ids, cudaStream_t stream) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    return false;
++#endif
++    static const int mode = getenv("GGML_CUDA_PQ2_GEMV") ? atoi(getenv("GGML_CUDA_PQ2_GEMV")) : 0;
++    static const int min_rows = getenv("GGML_CUDA_PQ2_GEMV_MIN_ROWS") ? atoi(getenv("GGML_CUDA_PQ2_GEMV_MIN_ROWS")) : 2048;
++    if (!mode || has_ids || ncols_dst != 1 || nchannels_dst != 1 || nsamples_dst != 1) {
++        return false;
++    }
++    if (ncols_x % 1024 != 0 || nrows_x < min_rows || stride_row_x != ncols_x / QK_PQ2_0) {
++        return false;
++    }
++    if (((uintptr_t) vx & 15) || ((uintptr_t) vy & 15) || (fusion.gate && ((uintptr_t) fusion.gate & 15))) {
++        return false;
++    }
++    if (fusion.x_scale || fusion.gate_scale) {
++        return false;
++    }
++    const uint32_t nchunks  = ncols_x / 1024;
++    const uint32_t row_ints = (uint32_t) (ncols_x / QK_PQ2_0) * 34 / 4; // 34-byte blocks, row size is a multiple of 272 bytes
++    constexpr int warp = 32; // physical warp size on NVIDIA; the helper is __device__-only. The fast path is CUDA-only (see guard above).
++    static const int nw_env = getenv("GGML_CUDA_PQ2_GEMV_NW") ? atoi(getenv("GGML_CUDA_PQ2_GEMV_NW")) : 0;
++    const int nw = nw_env ? nw_env : (nchunks <= 5 ? 4 : nchunks <= 8 ? 8 : 16);
++    const dim3 block_nums((nrows_x + warp - 1) / warp, 1, 1);
++    const dim3 block_dims(warp, nw, 1);
++    const ggml_cuda_kernel_launch_params lp(block_nums, block_dims, 0, stream); // __shared__ arrays are statically sized
++#define PQ2_GEMV_LAUNCH(NWV) \
++    if (fusion.gate) { \
++        ggml_cuda_kernel_launch(pq2_gemv_rows<NWV, true>, lp, vx, fusion.gate, vy, (const float *) fusion.x_bias, \
++            (const float *) fusion.gate_bias, dst, (uint32_t) nrows_x, nchunks, row_ints, (int) fusion.glu_op); \
++    } else { \
++        ggml_cuda_kernel_launch(pq2_gemv_rows<NWV, false>, lp, vx, nullptr, vy, (const float *) fusion.x_bias, \
++            nullptr, dst, (uint32_t) nrows_x, nchunks, row_ints, (int) fusion.glu_op); \
++    }
++    switch (nw) {
++        case 1:  PQ2_GEMV_LAUNCH(1);  break;
++        case 2:  PQ2_GEMV_LAUNCH(2);  break;
++        case 4:  PQ2_GEMV_LAUNCH(4);  break;
++        case 8:  PQ2_GEMV_LAUNCH(8);  break;
++        case 16: PQ2_GEMV_LAUNCH(16); break;
++        default: return false;
++    }
++#undef PQ2_GEMV_LAUNCH
++    return true;
++}
+-- 
+2.53.0
+
